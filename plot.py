@@ -9,8 +9,8 @@ import numpy as np
 # Set the maximum number of rows to be displayed
 pd.options.display.max_rows = 2000  # Change 100 to the desired number of rows you want to display
 
-line_styles = ['-', '--', ':']  # Different line styles for protoc values
-markers = ['o', 'D', 's']  # Different markers for host values
+line_styles = ['-', '--', ':']  # Different line styles for host values
+markers = ['o', 'D', 's']  # Different markers for protoc values
 colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
 
 
@@ -40,13 +40,10 @@ def read_accl_log_files(log_dir):
     accl_dataframes_filtered = accl_dataframes_con[~((accl_dataframes_con['collective'] == 'gather') & (accl_dataframes_con['rank_id'] != 0))]
     accl_dataframes_filtered = accl_dataframes_filtered[~((accl_dataframes_filtered['collective'] == 'reduce') & (accl_dataframes_filtered['rank_id'] != 0))]
 
-    # Filtering out rows with 'size' greater than 262144
-    accl_dataframes_filtered = accl_dataframes_filtered[accl_dataframes_filtered['size'] <= 262144]
     # Filtering out rows with 'number_of_nodes' greater than 8
     accl_dataframes_filtered = accl_dataframes_filtered[accl_dataframes_filtered['number_of_nodes'] <= 8]
 
     return accl_dataframes_filtered
-
 
 def read_host_device_log_files(log_dir):
     mpi_dataframes = []
@@ -150,6 +147,38 @@ def read_mpi_rdma_log_files(log_dir):
 
     return max_host_to_host_rows
 
+def plot_additive(title, x_datas, y_datas, y_series_labels, y_styles=None, logx=True, x_label='Size [B]', y_label='Latency [μs]', legend_loc=None):
+    if not(y_styles):
+        y_styles = [None for _ in range(len(y_series_labels))]
+
+    fig, ax = plt.subplots(figsize=(9,5))
+    series  = []
+    x_data = x_datas[0]
+    lines = ax.stackplot(x_data, y_datas, labels=y_series_labels)
+
+    plt.grid(True)
+    # Add some text for labels, title and custom x-axis tick labels, etc.
+    ax.set_ylabel(y_label,  fontsize=20)
+    # ax.axis(ymin=1)
+    ax.set_xlim(xmin=min(x_data), xmax=max(x_data))
+    #ax.set_title(title)
+
+    if logx:
+        ax.set_xscale('log', base=2)
+
+    if legend_loc is None:
+        ax.legend(loc="upper left", handlelength=4, handles=lines[1:] + [lines[0]])
+    else:
+        ax.legend(loc=legend_loc, fontsize=14, handlelength=4, handles=lines[1:] + [lines[0]])
+
+    if x_label == "Message Size":
+        ax.xaxis.set_major_formatter(ticker.FuncFormatter(lambda y, _: sizeof_fmt(y)))
+    plt.xticks(rotation=0, fontsize=18)
+    plt.yticks(fontsize=18)
+    plt.tight_layout()
+    ax.set_xlabel(x_label, fontsize=20)
+    plt.savefig(f"{title}.png", format='png', bbox_inches='tight')
+
 def generate_throughput_plots(accl_dataframes, output_dir):
     
     accl_df = accl_dataframes[(accl_dataframes['collective'] == 'sendrecv')]
@@ -157,6 +186,7 @@ def generate_throughput_plots(accl_dataframes, output_dir):
     # plot the throughput of send/recv
     accl_filter_df = accl_df[accl_df['rank_id'] == 1]
     plt.figure(figsize=(9,5))
+    i=0
     for host_idx, (host, host_group) in enumerate(accl_filter_df.groupby('host')):
         for stack_idx, (stack, stack_group) in enumerate(host_group.groupby('stack')):   
             for protoc_idx, (protoc, protoc_group) in enumerate(stack_group.groupby('protoc')):
@@ -166,15 +196,17 @@ def generate_throughput_plots(accl_dataframes, output_dir):
                         label=f'cclo-{protoc}-{stack}-{host}',
                         linestyle=line_styles[host_idx % len(line_styles)],
                         marker=markers[protoc_idx % len(markers)],
+                        color=colors[i % len(colors)],
                         linewidth=3, markersize=8, markeredgewidth=2)
+                i=i+1
     # OpenMPI + RDMA
     bufsize = np.array([512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304])
     thr = np.array([0.7726489309353635, 1.2779287701841844, 2.7302214434400196, 4.587270185413581, 8.350978141370119, 15.087549850518753, 24.924359525455834, 37.81030581465406, 52.47362080324127, 66.69514730661872, 77.53762086733578, 84.44661209626463, 87.91596214714582, 90.26373933885196])
     plt.plot(bufsize, thr,
             label=f'mpi-rdma-host',
-            # linestyle=line_styles[stack_idx % len(line_styles)],
+            linestyle='--',
             marker='^',
-            color='black',
+            color='red',
             linewidth=3, markersize=8, markeredgewidth=2)
 
     plt.xlabel('Size[B]',fontsize=18)
@@ -195,7 +227,7 @@ def generate_sep_time_size_plots(accl_dataframes, mpi_dataframes, host_device_da
     collective_values = accl_dataframes['collective'].unique()
     
     for collective in collective_values:
-        accl_df = accl_dataframes[(accl_dataframes['collective'] == collective)]
+        accl_df = accl_dataframes[(accl_dataframes['collective'] == collective)  & (accl_dataframes['size'] <= 262144)]
         mpi_df = mpi_dataframes.loc[(mpi_dataframes.index.get_level_values("collective") == collective)]
         hd_df = host_device_dataframes.loc[(host_device_dataframes.index.get_level_values("collective") == collective)]
         
@@ -281,7 +313,7 @@ def generate_time_size_plots_merge_eager_rndzvs(accl_dataframes, mpi_dataframes,
     collective_values = accl_dataframes['collective'].unique()
     
     for collective in collective_values:
-        accl_df = accl_dataframes[(accl_dataframes['collective'] == collective)]
+        accl_df = accl_dataframes[(accl_dataframes['collective'] == collective)  & (accl_dataframes['size'] <= 262144)]
         mpi_df = mpi_dataframes.loc[(mpi_dataframes.index.get_level_values("collective") == collective)]
         hd_df = host_device_dataframes.loc[(host_device_dataframes.index.get_level_values("collective") == collective)]
         
@@ -417,12 +449,11 @@ def generate_time_size_plots_merge_eager_rndzvs(accl_dataframes, mpi_dataframes,
                         plt.savefig(os.path.join(output_dir, f'{collective}_rank_{nodes}_{host}_execution_time_merge.png'))
                         plt.close()
 
-
 def generate_time_size_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, node_value):
     collective_values = accl_dataframes['collective'].unique()
     
     for collective in collective_values:
-        accl_df = accl_dataframes[(accl_dataframes['collective'] == collective)]
+        accl_df = accl_dataframes[(accl_dataframes['collective'] == collective)  & (accl_dataframes['size'] <= 262144)]
         mpi_df = mpi_dataframes.loc[(mpi_dataframes.index.get_level_values("collective") == collective)]
         hd_df = host_device_dataframes.loc[(host_device_dataframes.index.get_level_values("collective") == collective)]
         
@@ -546,7 +577,7 @@ def generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataf
 
     for collective in collective_values:
         if collective != 'sendrecv':
-            accl_df = accl_dataframes[(accl_dataframes['collective'] == collective)]
+            accl_df = accl_dataframes[(accl_dataframes['collective'] == collective)  & (accl_dataframes['size'] <= 262144)]
             mpi_df = mpi_dataframes.loc[(mpi_dataframes.index.get_level_values("collective") == collective)]
             hd_df = host_device_dataframes.loc[(host_device_dataframes.index.get_level_values("collective") == collective)]
             # Filter data for size
@@ -636,9 +667,62 @@ def generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataf
                 plt.tight_layout()
                 plt.savefig(os.path.join(output_dir, f'{collective}_size_{size_kb}KB_{host}_execution_time.png'))
                 plt.close()
-            
+
+def latency_breakdown(error=False):
+    # broadcast
+    series_label = []
+    series_y     = []
+    series_x     = []
+    styles       = []
+    stdevs       = []
+    breakpoint = 11
+
+    bufsize = np.array([512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144, 524288, 1048576, 2097152, 4194304])
+    fh = [13.888764000000002, 11.059779999999998, 11.149212, 11.237948000000001, 11.490864000000002, 12.432864000000002, 13.788632, 16.456580000000002, 22.034295999999998, 32.552080000000004, 54.42410399999999, 107.308596, 196.2307, 368.71310000000005]
+    fh_std = [5.512100217186186, 0.34413273543794126, 0.27489813214352704, 0.3652826430259177, 0.2500485023030532, 0.25619429639240604, 0.2586189950023006, 0.2624837434966211, 0.42741572313615245, 0.3893609656860839, 1.104373464541773, 1.4193851939427862, 5.377396685571933, 1.6945929570253706]
+    mpi = [13.114632, 13.614564, 12.894744, 18.374896, 19.036768, 23.279864, 29.262196, 49.220988000000006, 88.575212, 166.908944, 325.63450800000004, 643.086088, 1277.28476, 2545.22112]
+    mpi_std = [1.1602307290259122, 0.5146638571961314, 0.7359798628114765, 0.3887091524314806, 0.6079382025962835, 0.46755179125311885, 1.1156919850854894, 0.5207615921475007, 0.44911810368320715, 2.670622025832934, 0.6173208970511167, 0.9972786853512857, 1.3918805057906407, 0.5326585638098759]
+    hf = [15.201824, 11.976196, 12.092144000000001, 12.191952, 12.501655999999999, 13.331800000000001, 17.021756, 17.614883999999996, 23.30192, 35.821708, 59.62975599999999, 124.534576, 211.782104, 408.62922399999997]
+    hf_std = [6.651402709881879, 0.35229712116904954, 0.4064142065233448, 0.42474470178684987, 0.641864279785065, 0.5117330475941532, 5.375818835532313, 0.5155476219943216, 0.45789663637113576, 0.5841435223778485, 1.8558411528102294, 108.11323790276667, 3.1424371098216106, 3.99487642134572]
+    nop = [12 for _ in bufsize]
+    nop_std = [4.42 for _ in bufsize]
+    streaming = [b / 32 * 0.0022 for b in bufsize]
+    zero = [0 for _ in bufsize]
+
+    # series_label.append(f"Kernel invocation")
+    # series_y.append(np.array(nop))
+    # series_x.append(bufsize)
+    # stdevs.append(np.array(nop_std))
+    # styles.append(f"C1+-")
+
+    # series_label.append(f"Stream flushing")
+    # series_y.append(np.array(streaming))
+    # series_x.append(bufsize)
+    # stdevs.append(np.array(zero))
+    # styles.append(f"C2+-")
+
+    series_label.append(f"FPGA HBM to host DDR")
+    series_y.append(np.array(fh))
+    series_x.append(bufsize)
+    stdevs.append(np.array(fh_std))
+    styles.append(f"C3+-")
+
+    series_label.append(f"MPI using RoCE")
+    series_y.append(np.array(mpi))
+    series_x.append(bufsize)
+    stdevs.append(np.array(mpi_std))
+    styles.append(f"C4+-")
+
+    series_label.append(f"Host DDR to FPGA HBM")
+    series_y.append(np.array(hf))
+    series_x.append(bufsize)
+    stdevs.append(np.array(hf_std))
+    styles.append(f"C5+-")
+
+    plot_additive("latency_breakdown_bcast_stacked_nr_8", [s[:breakpoint] for s in series_x], [s[:breakpoint] for s in series_y], series_label, styles, y_label='Latency [μs]', logx=True, legend_loc="upper left")
+
 if __name__ == "__main__":
-    accl_log_dir = "../accl_results/results_reduce"  # Update this to the directory containing your log files
+    accl_log_dir = "../accl_results/results_send"  # Update this to the directory containing your log files
     output_dir = "../plots/"
     host_device_log_dir = "./host_device" 
     mpi_log_dir = "./results_eth_rdma" # point to mpi new results 
@@ -650,7 +734,7 @@ if __name__ == "__main__":
     host_device_dataframes = read_host_device_log_files(host_device_log_dir)
     mpi_dataframes = read_mpi_rdma_log_files(mpi_log_dir)
     # print(mpi_dataframes)
-    print(host_device_dataframes)
+    # print(host_device_dataframes)
     # print(accl_dataframes)
     generate_throughput_plots(accl_dataframes, output_dir)
     generate_time_size_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 8)
@@ -659,3 +743,4 @@ if __name__ == "__main__":
     generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 4)
     generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 64)
     generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 128)
+    latency_breakdown()
