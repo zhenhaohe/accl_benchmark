@@ -721,11 +721,35 @@ def latency_breakdown(error=False):
 
     plot_additive("latency_breakdown_bcast_stacked_nr_8", [s[:breakpoint] for s in series_x], [s[:breakpoint] for s in series_y], series_label, styles, y_label='Latency [μs]', logx=True, legend_loc="upper left")
 
+def nop_comparison():
+    # Example data
+    exp = ('cclo', 'coyote', 'xrt')
+    y_pos = np.arange(len(exp))
+    performance = (0.324436363636364, 3.77240909090909, 45.3165445544555)
+    error = (0.002256599994744, 0.250456218425077, 4.94712507124037)
+
+    fig, ax = plt.subplots(figsize=(9,3))
+
+    hbars = ax.barh(y_pos, performance, xerr=error, align='center')
+    ax.set_yticks(y_pos, labels=exp, fontsize=18)
+    
+    ax.invert_yaxis()  # labels read top-to-bottom
+    ax.set_xlabel('NOP Latency [us]', fontsize=18)
+
+    # Label with specially formatted floats
+    ax.bar_label(hbars, fmt='%.2f', fontsize=18)
+    # ax.set_xlim(right=15)  # adjust xlim to fit labels
+    
+    plt.xticks(fontsize=18)
+    plt.tight_layout()
+    plt.savefig(f"nop_comparison.png", format='png', bbox_inches='tight')
+    plt.close()
+
 if __name__ == "__main__":
-    accl_log_dir = "../accl_results/results_send"  # Update this to the directory containing your log files
+    accl_log_dir = "./accl_rdma_results/results_send"  # Update this to the directory containing your log files
     output_dir = "../plots/"
     host_device_log_dir = "./host_device" 
-    mpi_log_dir = "./results_eth_rdma" # point to mpi new results 
+    mpi_log_dir = "./mpi_rdma_results" # point to mpi new results 
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -744,3 +768,4 @@ if __name__ == "__main__":
     generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 64)
     generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 128)
     latency_breakdown()
+    nop_comparison()
