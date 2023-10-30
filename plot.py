@@ -5,6 +5,8 @@ from os import error, listdir, name, terminal_size
 from os.path import isfile, join
 from numpy import average, mean, std
 import numpy as np
+import sys
+
 
 # Set the maximum number of rows to be displayed
 pd.options.display.max_rows = 2000  # Change 100 to the desired number of rows you want to display
@@ -13,9 +15,10 @@ line_styles = ['-', '--', ':']  # Different line styles for host values
 markers = ['o', 'D', 's']  # Different markers for protoc values
 colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#9467bd', '#8c564b', '#e377c2', '#7f7f7f', '#bcbd22', '#17becf']
 
+nop_coyote = 3.77240909090909
 
 # Read and process log files
-def read_accl_log_files(log_dir):
+def read_accl_log_files(log_dir, recursive=False):
     accl_dataframes = []
     column_names = [
         "collective", "number_of_nodes", "rank_id", "number_of_banks",
@@ -23,16 +26,21 @@ def read_accl_log_files(log_dir):
         "execution_time", "throughput", "host", "protoc", "stack"
     ]
 
-    for filename in os.listdir(log_dir):
-        if filename.endswith(".log"):
-            filepath = os.path.join(log_dir, filename)
-
-            # Skip directories and only process regular files
-            if not os.path.isfile(filepath):
-                continue
-
-            df = pd.read_csv(filepath, header=None)
-            accl_dataframes.append(df)
+    if recursive:
+        for root, dirs, files in os.walk(log_dir):
+            for filename in files:
+                if filename.endswith(".log"):
+                    filepath = os.path.join(root, filename)
+                    df = pd.read_csv(filepath, header=None)
+                    accl_dataframes.append(df)
+    else:
+        for filename in os.listdir(log_dir):
+            if filename.endswith(".log"):
+                filepath = os.path.join(log_dir, filename)
+                if not os.path.isfile(filepath):
+                    continue
+                df = pd.read_csv(filepath, header=None)
+                accl_dataframes.append(df)
     
     accl_dataframes_con = pd.concat(accl_dataframes)
     accl_dataframes_con.columns = column_names
@@ -73,8 +81,14 @@ def read_host_device_log_files(log_dir):
     
     return grouped_df
 
+def extract_pattern(filename):
+    # Split the filename by "-" and extract the last part
+    last_part = filename.split('-')[-1]
+    # Remove ".csv" extension and return the last number
+    return last_part.replace('.csv', '')
+
 def read_mpi_rdma_log_files(log_dir):
-    
+
     mpi_dataframes = []
     
     column_names = [
@@ -82,13 +96,6 @@ def read_mpi_rdma_log_files(log_dir):
         "host_to_host_send", "host_to_fpga"
     ]
     
-    # Define a function to extract the last number before ".csv" from file names
-    def extract_pattern(filename):
-        # Split the filename by "-" and extract the last part
-        last_part = filename.split('-')[-1]
-        # Remove ".csv" extension and return the last number
-        return last_part.replace('.csv', '')
-
     # Iterate through files in the directory
     for filename in os.listdir(log_dir):
         file_path = os.path.join(log_dir, filename)
@@ -137,7 +144,7 @@ def read_mpi_rdma_log_files(log_dir):
     # Add the "size" column by multiplying "count" by 4
     grouped_df["size"] = grouped_df.index.get_level_values('count') * 4
 
-    print(grouped_df)
+    # print(grouped_df)
 
     # Get the index of the maximum host_to_host value for each group
     max_host_to_host_idx = grouped_df.groupby(["collective", "count", "number_of_nodes"])["host_to_host"].idxmax()
@@ -147,11 +154,54 @@ def read_mpi_rdma_log_files(log_dir):
 
     return max_host_to_host_rows
 
-def plot_additive(title, x_datas, y_datas, y_series_labels, y_styles=None, logx=True, x_label='Size [B]', y_label='Latency [μs]', legend_loc=None):
+def load_logs_under(path):
+    log_files = [join(path, f) for f in listdir(path) if (isfile(join(path, f)) and (f.endswith(".log") or f.endswith(".csv")))]
+    print("log and csv files ingested", log_files)
+    logs = []
+    for log_path in log_files:
+        logs.append(pd.read_csv(log_path))  # Assuming CSV files are being read
+
+    return pd.concat(logs)
+
+def preprocess_h2rc_dataframe(df):
+    headers = df.columns.tolist()
+    df = df[df[headers[0]]!=headers[0]].reset_index(drop=True)
+    for column_name in ["number of nodes","rank id","number of banks","buffer size[KB]","segment_size[KB]","execution_time[us]","throughput[Gbps]","execution_time_fullpath[us]","throughput_fullpath[Gbps]"]:
+        df[column_name] = pd.to_numeric(df[column_name])
+
+    df.drop(columns=['experiment'], inplace=True)  
+    df.drop(columns=['board_instance'], inplace=True)  
+
+    df.rename(columns={'collective name': 'collective'}, inplace=True)
+    df.rename(columns={'number of nodes': 'number_of_nodes'}, inplace=True)
+    df.rename(columns={'rank id': 'rank_id'}, inplace=True)
+    df.rename(columns={'number of banks': 'number_of_banks'}, inplace=True)
+    df.rename(columns={'segment_size[KB]': 'segment_size[B]'}, inplace=True)
+    df['segment_size[B]'] = df['segment_size[B]'] * 1024
+
+    df["collective"] = df["collective"].apply(lambda x: "allreduce" if x == "Allreduce" else x)
+    df["collective"] = df["collective"].apply(lambda x: "reduce" if x == "Reduce" else x)
+    df["collective"] = df["collective"].apply(lambda x: "scatter" if x == "Scatter" else x)
+    df["collective"] = df["collective"].apply(lambda x: "bcast" if x == "Broadcast" else x)
+    df["collective"] = df["collective"].apply(lambda x: "allgather" if x == "Allgather" else x)
+    df["collective"] = df["collective"].apply(lambda x: "gather" if x == "Gather" else x)
+
+    # need to covert this buffer size to the semantic of message size, especially for scatter, gather, and allgather
+    df.rename(columns={'buffer size[KB]': 'size[B]'}, inplace=True)
+    df['size[B]'] = df['size[B]'] * 1024
+    df.loc[df['collective'] == 'scatter', 'size[B]'] /= df['number_of_nodes']
+    df.loc[df['collective'] == 'gather', 'size[B]'] /= df['number_of_nodes']
+    df.loc[df['collective'] == 'allgather', 'size[B]'] /= df['number_of_nodes']
+
+    return df
+
+# Generate plots   
+def plot_additive(output_dir, title, x_datas, y_datas, y_series_labels, y_styles=None, logx=True, x_label='Size [B]', y_label='Latency [μs]', legend_loc=None):
+    
     if not(y_styles):
         y_styles = [None for _ in range(len(y_series_labels))]
 
-    fig, ax = plt.subplots(figsize=(9,5))
+    fig, ax = plt.subplots(figsize=(9,4))
     series  = []
     x_data = x_datas[0]
     lines = ax.stackplot(x_data, y_datas, labels=y_series_labels)
@@ -177,7 +227,80 @@ def plot_additive(title, x_datas, y_datas, y_series_labels, y_styles=None, logx=
     plt.yticks(fontsize=18)
     plt.tight_layout()
     ax.set_xlabel(x_label, fontsize=20)
-    plt.savefig(f"{title}.png", format='png', bbox_inches='tight')
+
+    # Create the output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    # Save the plot to the specified directory
+    output_path = os.path.join(output_dir, f"{title}.png")
+    plt.savefig(output_path, format='png', bbox_inches='tight')
+    plt.close()
+
+def plot_lines(output_dir, title, x_datas, y_datas, y_series_labels, y_styles=None, logx=True, logy=True, x_label='Size[B]', y_label='Latency [μs]', y_errors=None, legend_loc=None, throughput=False):
+    if not(y_styles):
+        y_styles = [None for _ in range(len(y_series_labels))]
+
+    if not(y_errors):
+        y_errors = [None for _ in range(len(y_series_labels))]
+
+    if throughput:
+        fig, ax = plt.subplots(figsize=(9,5))
+    elif title.startswith('rank'):
+        fig, ax = plt.subplots()
+    else:
+        fig, ax = plt.subplots()
+    series  = []
+    for x, y, y_series_label, y_style, y_error in zip(x_datas, y_datas, y_series_labels, y_styles, y_errors):
+        if y_style:
+            if not y_error is None:
+                series.append(ax.errorbar(x, y,  yerr = y_error, fmt=y_style, label=y_series_label, capsize=4.0, linewidth=3, markersize=8, markeredgewidth=3))
+            else:
+                line, = ax.plot(x, y, y_style, label=y_series_label, linewidth=3, markersize=8, markeredgewidth=3)
+                series.append(line)
+        else:
+            if not y_error is None:
+                series.append(ax.errorbar(x, y,  yerr = y_error, fmt=y_style, label=y_series_label, capsize=4.0, linewidth=3, markersize=8, markeredgewidth=3))
+            else:
+                line, = ax.plot(x, y, label=y_series_label, linewidth=3, markersize=8, markeredgewidth=3)
+                series.append(line)
+
+    plt.grid(True)
+    # Add some text for labels, title and custom x-axis tick labels, etc.
+    if throughput:
+        ax.set_ylabel('Throughput [Gbps]', fontsize=20)
+        ax.set_ylim(ymax=100)
+    else:
+        ax.set_ylabel(y_label,  fontsize=20)
+    #ax.set_title(title)
+
+    if title.startswith('rank'):
+        ax.set_ylim(top=1750)
+
+    if logy:
+        ax.set_yscale('log', base=2)
+
+    if logx:
+        ax.set_xscale('log', base=2)
+
+    if legend_loc is None :
+        if logy:
+            ax.legend(series, y_series_labels, loc="lower right", handlelength=4, fontsize=18)
+        else:
+            ax.legend(series, y_series_labels, loc="upper left", handlelength=4, fontsize=18)
+    else:
+        ax.legend(    series, y_series_labels, loc=legend_loc, fontsize=18, handlelength=4)
+
+    plt.xticks(rotation=0, fontsize=18)
+    plt.yticks(fontsize=18)
+    ax.set_xlabel(x_label, fontsize=20)
+    plt.tight_layout()
+    # plt.show()
+
+    # Create the output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    # Save the plot to the specified directory
+    output_path = os.path.join(output_dir, f"{title}.png")
+    plt.savefig(output_path, format='png', bbox_inches='tight')
+    plt.close()
 
 def generate_throughput_plots(accl_dataframes, output_dir):
     
@@ -185,7 +308,7 @@ def generate_throughput_plots(accl_dataframes, output_dir):
 
     # plot the throughput of send/recv
     accl_filter_df = accl_df[accl_df['rank_id'] == 1]
-    plt.figure(figsize=(9,5))
+    plt.figure(figsize=(9,4))
     i=0
     for host_idx, (host, host_group) in enumerate(accl_filter_df.groupby('host')):
         for stack_idx, (stack, stack_group) in enumerate(host_group.groupby('stack')):   
@@ -221,8 +344,6 @@ def generate_throughput_plots(accl_dataframes, output_dir):
     plt.savefig(os.path.join(output_dir, f'sendrecv_throughput.png'))
     plt.close()
             
-# Generate plots
-# plot separate figures for host and device
 def generate_sep_time_size_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, node_value):
     collective_values = accl_dataframes['collective'].unique()
     
@@ -254,6 +375,8 @@ def generate_sep_time_size_plots(accl_dataframes, mpi_dataframes, host_device_da
                         for stack_idx, (stack, stack_group) in enumerate(host_group.groupby('stack')):   
                             for protoc_idx, (protoc, protoc_group) in enumerate(stack_group.groupby('protoc')):
                                 accl_avg_time = protoc_group.groupby('size')['execution_time'].mean()
+                                if (host == "host"):
+                                    accl_avg_time += nop_coyote
                                 plt.plot(accl_avg_time.index, accl_avg_time,
                                         label=f'cclo-{protoc}-{stack}-{host}',
                                         linestyle=line_styles[host_idx % len(line_styles)],
@@ -377,8 +500,13 @@ def generate_time_size_plots_merge_eager_rndzvs(accl_dataframes, mpi_dataframes,
                                     if array_eager[idx] < array_rndzvs[idx]:
                                         array_eager_value = np.append(array_eager_value, [array_eager[idx]]) 
                                         array_eager_idx = np.append(array_eager_idx, [union_indices[idx]]) 
+                                    else:
+                                        break
                                 print(array_eager_value)
                                 print(array_eager_idx)
+
+                                if (host == "host"):
+                                    accl_avg_time += nop_coyote
 
                                 plt.plot(union_indices, accl_avg_time,
                                             label=f'cclo-rndzvs-{stack}-{host}',
@@ -387,6 +515,8 @@ def generate_time_size_plots_merge_eager_rndzvs(accl_dataframes, mpi_dataframes,
                                             linewidth=3, markersize=8, markeredgewidth=2)
                                 
                                 if array_eager_value.size != 0:
+                                    if (host == "host"):
+                                        array_eager_value += nop_coyote
                                     plt.plot(array_eager_idx, array_eager_value,
                                             label=f'cclo-eager-{stack}-{host}',
                                             linestyle=line_styles[host_idx % len(line_styles)],
@@ -394,12 +524,16 @@ def generate_time_size_plots_merge_eager_rndzvs(accl_dataframes, mpi_dataframes,
                                             linewidth=3, markersize=8, markeredgewidth=2)
                             else:
                                 if accl_avg_time_rndzvs is None and accl_avg_time_eager is not None:
+                                    if (host == "host"):
+                                        accl_avg_time_eager += nop_coyote
                                     plt.plot(accl_avg_time_eager.index, accl_avg_time_eager,
                                             label=f'cclo-{stack}-{host}',
                                             linestyle=line_styles[host_idx % len(line_styles)],
                                             marker=markers[1 % len(markers)],
                                             linewidth=3, markersize=8, markeredgewidth=2)
                                 if accl_avg_time_eager is None and accl_avg_time_rndzvs is not None:
+                                    if (host == "host"):
+                                        accl_avg_time_rndzvs += nop_coyote
                                     plt.plot(accl_avg_time_rndzvs.index, accl_avg_time_rndzvs,
                                             label=f'cclo-{stack}-{host}',
                                             linestyle=line_styles[host_idx % len(line_styles)],
@@ -512,6 +646,9 @@ def generate_time_size_plots(accl_dataframes, mpi_dataframes, host_device_datafr
                                 print(accl_avg_time)
                                 print(union_indices)
 
+                                if (host == "host"):
+                                    accl_avg_time += nop_coyote
+
                                 plt.plot(union_indices, accl_avg_time,
                                         label=f'cclo-{stack}-{host}',
                                         linestyle=line_styles[host_idx % len(line_styles)],
@@ -519,12 +656,16 @@ def generate_time_size_plots(accl_dataframes, mpi_dataframes, host_device_datafr
                                         linewidth=3, markersize=8, markeredgewidth=2)
                             else:
                                 if accl_avg_time_rndzvs is None and accl_avg_time_eager is not None:
+                                    if (host == "host"):
+                                        accl_avg_time_eager += nop_coyote
                                     plt.plot(accl_avg_time_eager.index, accl_avg_time_eager,
                                             label=f'cclo-{stack}-{host}',
                                             linestyle=line_styles[host_idx % len(line_styles)],
                                             marker=markers[protoc_idx % len(markers)],
                                             linewidth=3, markersize=8, markeredgewidth=2)
                                 if accl_avg_time_eager is None and accl_avg_time_rndzvs is not None:
+                                    if (host == "host"):
+                                        accl_avg_time_rndzvs += nop_coyote
                                     plt.plot(accl_avg_time_rndzvs.index, accl_avg_time_rndzvs,
                                             label=f'cclo-{stack}-{host}',
                                             linestyle=line_styles[host_idx % len(line_styles)],
@@ -600,6 +741,8 @@ def generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataf
                     for protoc_idx, (protoc, protoc_group) in enumerate(stack_group.groupby('protoc')):
                         accl_avg_time = protoc_group.groupby('number_of_nodes')['execution_time'].mean()
                         accl_std = protoc_group.groupby('number_of_nodes')['execution_time'].std()
+                        if (host == "host"):
+                            accl_avg_time += nop_coyote
                         print(accl_std)
                         accl_max_x = accl_avg_time.index.max()
                         accl_min_x = accl_avg_time.index.min()
@@ -668,7 +811,7 @@ def generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataf
                 plt.savefig(os.path.join(output_dir, f'{collective}_size_{size_kb}KB_{host}_execution_time.png'))
                 plt.close()
 
-def latency_breakdown(error=False):
+def latency_breakdown(output_dir, error=False):
     # broadcast
     series_label = []
     series_y     = []
@@ -684,16 +827,16 @@ def latency_breakdown(error=False):
     mpi_std = [1.1602307290259122, 0.5146638571961314, 0.7359798628114765, 0.3887091524314806, 0.6079382025962835, 0.46755179125311885, 1.1156919850854894, 0.5207615921475007, 0.44911810368320715, 2.670622025832934, 0.6173208970511167, 0.9972786853512857, 1.3918805057906407, 0.5326585638098759]
     hf = [15.201824, 11.976196, 12.092144000000001, 12.191952, 12.501655999999999, 13.331800000000001, 17.021756, 17.614883999999996, 23.30192, 35.821708, 59.62975599999999, 124.534576, 211.782104, 408.62922399999997]
     hf_std = [6.651402709881879, 0.35229712116904954, 0.4064142065233448, 0.42474470178684987, 0.641864279785065, 0.5117330475941532, 5.375818835532313, 0.5155476219943216, 0.45789663637113576, 0.5841435223778485, 1.8558411528102294, 108.11323790276667, 3.1424371098216106, 3.99487642134572]
-    nop = [12 for _ in bufsize]
-    nop_std = [4.42 for _ in bufsize]
+    nop = [3.77240909090909 for _ in bufsize]
+    nop_std = [0 for _ in bufsize]
     streaming = [b / 32 * 0.0022 for b in bufsize]
     zero = [0 for _ in bufsize]
 
-    # series_label.append(f"Kernel invocation")
-    # series_y.append(np.array(nop))
-    # series_x.append(bufsize)
-    # stdevs.append(np.array(nop_std))
-    # styles.append(f"C1+-")
+    series_label.append(f"FPGA kernel invocation from host")
+    series_y.append(np.array(nop))
+    series_x.append(bufsize)
+    stdevs.append(np.array(nop_std))
+    styles.append(f"C1+-")
 
     # series_label.append(f"Stream flushing")
     # series_y.append(np.array(streaming))
@@ -701,7 +844,7 @@ def latency_breakdown(error=False):
     # stdevs.append(np.array(zero))
     # styles.append(f"C2+-")
 
-    series_label.append(f"FPGA HBM to host DDR")
+    series_label.append(f"FPGA kernel to host DDR")
     series_y.append(np.array(fh))
     series_x.append(bufsize)
     stdevs.append(np.array(fh_std))
@@ -713,17 +856,16 @@ def latency_breakdown(error=False):
     stdevs.append(np.array(mpi_std))
     styles.append(f"C4+-")
 
-    series_label.append(f"Host DDR to FPGA HBM")
+    series_label.append(f"Host DDR to FPGA kernel")
     series_y.append(np.array(hf))
     series_x.append(bufsize)
     stdevs.append(np.array(hf_std))
     styles.append(f"C5+-")
 
-    plot_additive("latency_breakdown_bcast_stacked_nr_8", [s[:breakpoint] for s in series_x], [s[:breakpoint] for s in series_y], series_label, styles, y_label='Latency [μs]', logx=True, legend_loc="upper left")
+    plot_additive(output_dir, "latency_breakdown_bcast_stacked_nr_8", [s[:breakpoint] for s in series_x], [s[:breakpoint] for s in series_y], series_label, styles, y_label='Latency [μs]', logx=True, legend_loc="upper left")
 
-def nop_comparison():
-    # Example data
-    exp = ('cclo', 'coyote', 'xrt')
+def nop_comparison(output_dir):
+    exp = ('kernel-hw', 'coyote-sw', 'xrt-sw')
     y_pos = np.arange(len(exp))
     performance = (0.324436363636364, 3.77240909090909, 45.3165445544555)
     error = (0.002256599994744, 0.250456218425077, 4.94712507124037)
@@ -734,7 +876,7 @@ def nop_comparison():
     ax.set_yticks(y_pos, labels=exp, fontsize=18)
     
     ax.invert_yaxis()  # labels read top-to-bottom
-    ax.set_xlabel('NOP Latency [us]', fontsize=18)
+    ax.set_xlabel('CCLO Invocation Latency [us]', fontsize=18)
 
     # Label with specially formatted floats
     ax.bar_label(hbars, fmt='%.2f', fontsize=18)
@@ -742,30 +884,146 @@ def nop_comparison():
     
     plt.xticks(fontsize=18)
     plt.tight_layout()
-    plt.savefig(f"nop_comparison.png", format='png', bbox_inches='tight')
+
+    # Create the output directory if it doesn't exist
+    os.makedirs(output_dir, exist_ok=True)
+    # Save the plot to the specified directory
+    output_path = os.path.join(output_dir, "nop_comparison.png")
+    plt.savefig(output_path, format='png', bbox_inches='tight')
     plt.close()
 
+def compare_tcp_time_size_plots(accl_xrt_tcp_dataframes, accl_h2rc_tcp_dataframes, mpi_tcp_dataframes, outpt_dir, number_of_nodes=8, error=False):
+    # df_accl_xrt_tcp     = accl_xrt_tcp_dataframes[(accl_xrt_tcp_dataframes["rank_id"] == 0) & (accl_xrt_tcp_dataframes["number_of_nodes"]==number_of_nodes)]
+    # df_accl_h2rc_tcp    = accl_h2rc_tcp_dataframes[(accl_h2rc_tcp_dataframes["rank_id"] == 0) & (accl_h2rc_tcp_dataframes["number_of_nodes"]==number_of_nodes)]
+    # df_mpi              = mpi_tcp_dataframes[(mpi_tcp_dataframes["rank_id"] == 0) & (mpi_tcp_dataframes["number_of_nodes"]==number_of_nodes)]
+    df_accl_xrt_tcp     = accl_xrt_tcp_dataframes[(accl_xrt_tcp_dataframes["number_of_nodes"]==number_of_nodes)]
+    df_accl_h2rc_tcp    = accl_h2rc_tcp_dataframes[(accl_h2rc_tcp_dataframes["number_of_nodes"]==number_of_nodes)]
+    df_mpi              = mpi_tcp_dataframes[(mpi_tcp_dataframes["number_of_nodes"]==number_of_nodes)]
+    df_accl_xrt_tcp = df_accl_xrt_tcp[(df_accl_xrt_tcp['size[B]'] <= 4 * 1024 * 1024) & (df_accl_xrt_tcp['size[B]'] >= 1024)]
+    df_accl_h2rc_tcp = df_accl_h2rc_tcp[(df_accl_h2rc_tcp['size[B]'] <= 4 * 1024 * 1024) & (df_accl_h2rc_tcp['size[B]'] >= 1024)]
+    df_mpi = df_mpi[(df_mpi['size[B]'] <= 4 * 1024 * 1024) & (df_mpi['size[B]'] >= 1024)]
+    collectives         = df_accl_xrt_tcp['collective'].apply(lambda r: '_'.join(r.split('_')[:-1])).unique()
+    print(collectives, file=sys.stderr)
+
+    for collective in collectives:
+        subset_accl_xrt_tcp     = df_accl_xrt_tcp[(df_accl_xrt_tcp["collective"].str.startswith(collective)) & (df_accl_xrt_tcp["segment_size[B]"] == 4*1024*1024) & (df_accl_xrt_tcp["number_of_banks"] == 4) ]
+        grouped_accl_xrt_tcp    = subset_accl_xrt_tcp.groupby(["collective", "size[B]"]).agg({'execution_time[us]':['mean','std']})
+        print(grouped_accl_xrt_tcp)
+        grouped_accl_xrt_tcp.reset_index(inplace=True)
+        grouped_accl_xrt_tcp    = grouped_accl_xrt_tcp.groupby(["collective"])
+
+        subset_accl_h2rc_tcp     = df_accl_h2rc_tcp[(df_accl_h2rc_tcp["collective"] == collective) & (df_accl_h2rc_tcp["segment_size[B]"] == 1*1024*1024) ]
+        grouped_accl_h2rc_tcp = subset_accl_h2rc_tcp.groupby(["collective", "size[B]"]).agg({
+            'execution_time[us]': ['mean', 'std'],
+            'execution_time_fullpath[us]': ['mean', 'std']
+        })
+        print(grouped_accl_h2rc_tcp)
+        grouped_accl_h2rc_tcp.reset_index(inplace=True)
+        grouped_accl_h2rc_tcp    = grouped_accl_h2rc_tcp.groupby(["collective"])
+
+        subset_mpi              = df_mpi[(df_mpi["collective"].str.startswith(collective)) ]
+        grouped_mpi             = subset_mpi.groupby(["collective", "size[B]"]).agg({'execution_time[us]':['mean','std']})
+        print(grouped_mpi)
+        grouped_mpi.reset_index(inplace=True)
+        grouped_mpi             = grouped_mpi.groupby(["collective"])
+
+        series_label = []
+        series_y     = []
+        series_x     = []
+        styles       = []
+        stdevs       = []
+        i = 0
+
+        # FPGA XRT TCP
+        for coll, group in grouped_accl_xrt_tcp:
+            exe          = group['execution_time[us]']['mean'].to_numpy()
+            exe_std      = group['execution_time[us]']['std'].to_numpy()
+            bufsize      = group['size[B]'].to_numpy()
+
+            if np.any(exe != 0):
+                if "K2K" in coll:
+                    series_label.append(f"cclo-tcp-device")
+                    series_y.append(exe)
+                    series_x.append(bufsize)
+                    stdevs.append(exe_std)
+                    styles.append(f"C0o-")
+                    i+=1
+        
+            if np.any(exe != 0):
+                if "H2H" in coll:
+                    series_label.append(f"cclo-tcp-host")
+                    series_y.append(exe)
+                    series_x.append(bufsize)
+                    stdevs.append(exe_std)
+                    styles.append(f"C1o-")
+                    i+=1
+        
+        # FPGA H2RC XRT TCP
+        for coll, group in grouped_accl_h2rc_tcp:
+            exe          = group['execution_time[us]']['mean'].to_numpy()
+            exe_std      = group['execution_time[us]']['std'].to_numpy()
+            exe_h2h      = group['execution_time_fullpath[us]']['mean'].to_numpy()
+            exe_h2h_std  = group['execution_time_fullpath[us]']['std'].to_numpy()
+            bufsize      = group['size[B]'].to_numpy()
+
+            if np.any(exe_h2h != 0):
+                series_label.append(f"accl-tcp-host")
+                series_y.append(exe_h2h)
+                series_x.append(bufsize)
+                stdevs.append(exe_h2h_std)
+                styles.append(f"C2s-")
+                i+=1
+        
+        # MPICH MPI baseline
+        for coll, group in grouped_mpi:
+            exe          = group['execution_time[us]']['mean'].to_numpy()
+            exe_std      = group['execution_time[us]']['std'].to_numpy()
+            bufsize      = group['size[B]'].to_numpy()
+        
+            if np.any(exe != 0):
+                series_label.append(f"mpi-tcp-host")
+                series_y.append(exe)
+                series_x.append(bufsize)
+                stdevs.append(exe_std)
+                styles.append(f"C3D-")
+                i+=1
+
+        plot_lines(output_dir, "compare_tcp_latency_"+collective.replace("/", "")+"_nr_"+str(number_of_nodes), series_x, series_y, series_label, styles, y_label='Latency [μs]', logx=True, legend_loc ="upper left", y_errors=(stdevs if error else None))
+
 if __name__ == "__main__":
-    accl_log_dir = "./accl_rdma_results/results_send"  # Update this to the directory containing your log files
-    output_dir = "../plots/"
+    accl_rdma_log_dir = "./accl_coyote_rdma_results/"  # Update this to the directory containing your log files
+    mpi_rdma_log_dir = "./mpi_rdma_results" # point to mpi new results 
+    accl_xrt_tcp_log_dir = "./accl_xrt_tcp_results"
+    accl_h2rc_tcp_log_dir = "./accl_xrt_tcp_H2RC"
+    mpi_tcp_log_dir = "./mpi_tcp_results"
     host_device_log_dir = "./host_device" 
-    mpi_log_dir = "./mpi_rdma_results" # point to mpi new results 
+    output_dir = "./plots/"
+    
 
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
 
-    accl_dataframes = read_accl_log_files(accl_log_dir)
+    accl_rdma_dataframes = read_accl_log_files(accl_rdma_log_dir, True)
     host_device_dataframes = read_host_device_log_files(host_device_log_dir)
-    mpi_dataframes = read_mpi_rdma_log_files(mpi_log_dir)
-    # print(mpi_dataframes)
+    mpi_rdma_dataframes = read_mpi_rdma_log_files(mpi_rdma_log_dir)
+    accl_xrt_tcp_dataframes = load_logs_under(accl_xrt_tcp_log_dir)
+    mpi_tcp_dataframes = load_logs_under(mpi_tcp_log_dir)
+    accl_h2rc_tcp_dataframes = load_logs_under(accl_h2rc_tcp_log_dir)
+    accl_h2rc_tcp_dataframes = preprocess_h2rc_dataframe(accl_h2rc_tcp_dataframes)
+
+    # print(mpi_rdma_dataframes)
     # print(host_device_dataframes)
-    # print(accl_dataframes)
-    generate_throughput_plots(accl_dataframes, output_dir)
-    generate_time_size_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 8)
-    generate_time_size_plots_merge_eager_rndzvs(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 8)
-    generate_sep_time_size_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 8)
-    generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 4)
-    generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 64)
-    generate_time_nodes_plots(accl_dataframes, mpi_dataframes, host_device_dataframes, output_dir, 128)
-    latency_breakdown()
-    nop_comparison()
+    # print(accl_rdma_dataframes)
+    print(accl_xrt_tcp_dataframes)
+    print(mpi_tcp_dataframes)
+    print(accl_h2rc_tcp_dataframes)
+    generate_throughput_plots(accl_rdma_dataframes, output_dir)
+    generate_time_size_plots(accl_rdma_dataframes, mpi_rdma_dataframes, host_device_dataframes, output_dir, 8)
+    generate_time_size_plots_merge_eager_rndzvs(accl_rdma_dataframes, mpi_rdma_dataframes, host_device_dataframes, output_dir, 8)
+    generate_sep_time_size_plots(accl_rdma_dataframes, mpi_rdma_dataframes, host_device_dataframes, output_dir, 8)
+    generate_time_nodes_plots(accl_rdma_dataframes, mpi_rdma_dataframes, host_device_dataframes, output_dir, 4)
+    generate_time_nodes_plots(accl_rdma_dataframes, mpi_rdma_dataframes, host_device_dataframes, output_dir, 64)
+    generate_time_nodes_plots(accl_rdma_dataframes, mpi_rdma_dataframes, host_device_dataframes, output_dir, 128)
+    latency_breakdown(output_dir)
+    nop_comparison(output_dir)
+    compare_tcp_time_size_plots(accl_xrt_tcp_dataframes, accl_h2rc_tcp_dataframes, mpi_tcp_dataframes, output_dir, 8)
